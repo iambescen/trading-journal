@@ -1268,8 +1268,8 @@ function toggleTheme() {
 const STORE_KEY = 'trading_journal_v1';
 
 // ── Версия сборки (обновляется при каждом деплое) ──
-const BUILD_VERSION = '28.06 18:59';
-const BUILD_DATE    = '28.06.2026 18:59 МСК';
+const BUILD_VERSION = '07.07 09:22';
+const BUILD_DATE    = '07.07.2026 09:22 МСК';
 function showBuildVersion() {
   const el = document.getElementById('app-build');
   if (!el) return;
@@ -1599,18 +1599,18 @@ async function parsePDFFile(file) {
   // "01.06.2026Перевод средств с C4640 на IB, площадка LBilling. 1 р. -3 398,98 р."
   const account_transactions = [];
   let payout = 0, rollover_fee = 0, funding = 0;
+  // Суммы по каждой дате (для дней без отчёта — выходные/праздники)
+  const byDate = {};
+  const _initDate = d => { if (!byDate[d]) byDate[d] = { payout: 0, rollover_fee: 0, funding: 0 }; };
   for (const line of lines) {
-    // Строки начинаются с даты (может быть слитно с текстом)
     const txM = line.match(/^(\d{2}\.\d{2}\.\d{4})\s*(.+?)\s+[\d ,]+\s*р\.\s+([-\d][\d ,]*,\d+)\s*р\.$/);
     if (!txM) continue;
     const txDate    = txM[1];
     const txComment = txM[2].trim();
     const txAmount  = ruN(txM[3]);
-
-    // Определяем тип
     let txType = 'other';
     let txAccRef = '', txPlatform = '';
-
+    _initDate(txDate);
     if (/Финансовый результат/i.test(txComment)) {
       txType = 'fin_result';
       const am = txComment.match(/счёт\s+([\w]+)/i);
@@ -1621,25 +1621,31 @@ async function parsePDFFile(file) {
       txType = 'payout';
       const am = txComment.match(/счёт\s+([\w]+)/i);
       txAccRef = am ? am[1] : '';
-      if (txDate === date) payout += txAmount; // только текущий день
+      byDate[txDate].payout += txAmount;
+      if (txDate === date) payout += txAmount;
     } else if (/Перевод средств с\s+\S+\s+на\s+IB/i.test(txComment)) {
       txType = 'rollover_fee';
       const am = txComment.match(/с\s+([\w]+)\s+на/i);
       txAccRef = am ? am[1] : '';
+      byDate[txDate].rollover_fee += txAmount;
       if (txDate === date) rollover_fee += txAmount;
     } else if (/Перевод средств с\s+IB\s+на/i.test(txComment)) {
       txType = 'funding';
       const am = txComment.match(/на\s+([\w]+)/i);
       txAccRef = am ? am[1] : '';
+      byDate[txDate].funding += txAmount;
       if (txDate === date) funding += txAmount;
     } else if (/Перевод средств с\s+\S+\s+на\s+\S+/i.test(txComment)) {
       txType = 'transfer';
       const am = txComment.match(/с\s+([\w]+)\s+на\s+([\w]+)/i);
       txAccRef = am ? `${am[1]} → ${am[2]}` : '';
     }
-
     account_transactions.push({ date: txDate, comment: txComment, type: txType, account_ref: txAccRef, platform: txPlatform, amount: txAmount });
   }
+  // Даты без торгов (выходные) с финансовыми операциями
+  const extra_dates = Object.entries(byDate)
+    .filter(([d, v]) => d !== date && (v.payout !== 0 || v.rollover_fee !== 0 || v.funding !== 0))
+    .map(([d, v]) => ({ date: d, payout: v.payout, rollover_fee: v.rollover_fee, funding: v.funding }));
 
   // Совместимость со старым полем
   const rollover = rollover_fee;
@@ -1696,6 +1702,7 @@ async function parsePDFFile(file) {
     equity, balance_end, balance_start, commission,
     payout, funding, rollover, rollover_fee,
     platforms, instruments, account_transactions, rollovers, trades,
+    extra_dates,
   };
 }
 
@@ -1718,6 +1725,34 @@ async function handlePDFUpload(event) {
       if (alreadyPending >= 0) pending.mx[alreadyPending] = report;
       else pending.mx.push(report);
       loaded++;
+
+      // Создать записи для дат без торгов (выходные/праздники) с операциями
+      for (const ed of (report.extra_dates || [])) {
+        const edDate = ed.date; // уже в формате DD.MM.YYYY
+        const alreadyEx = pending.mx.findIndex(r => r.date === edDate);
+        const extraReport = {
+          id: Date.now() + Math.random(),
+          date: edDate,
+          account: report.account,
+          source: 'pdf_extra',
+          file_name: report.file_name,
+          equity: 0, balance_end: 0, balance_start: 0, commission: 0,
+          payout: ed.payout, funding: ed.funding, rollover: ed.rollover_fee, rollover_fee: ed.rollover_fee,
+          platforms: [], instruments: [], account_transactions: [], rollovers: [], trades: [],
+          _note: `Операции без торгов из отчёта ${report.date}`,
+        };
+        if (alreadyEx >= 0) {
+          const ex = pending.mx[alreadyEx];
+          if (!ex.payout) ex.payout = ed.payout;
+          if (!ex.funding) ex.funding = ed.funding;
+          if (!ex.rollover_fee) ex.rollover_fee = ed.rollover_fee;
+          if (!ex.rollover) ex.rollover = ed.rollover_fee;
+        } else {
+          const inStore = store.mx.findIndex(r => r.date === edDate);
+          if (inStore < 0) pending.mx.push(extraReport);
+        }
+        loaded++;
+      }
     } catch(e) {
       errors.push(file.name + ': ' + e.message);
     }
@@ -1770,7 +1805,8 @@ function renderMXStaging() {
     const instrCount = (r.instruments || []).length;
     html += `<div class="staging-item" id="staging-mx-${i}">
       <div class="staging-item-header">
-        <span style="font-size:13px;font-weight:600">📄 ${r.file_name || 'report'}</span>
+        <span style="font-size:13px;font-weight:600">📄 ${r.file_name || 'report'}${r.source === 'pdf_extra' ? ' <span style="color:var(--amber);font-size:11px">⚠️ без торгов (выходной)</span>' : ''}</span>
+        ${r._note ? `<span style="font-size:11px;color:var(--text2)">${r._note}</span>` : ''}
         <button class="btn-confirm" onclick="confirmStagedMX(${i})">✓ Принять</button>
         <button class="btn-reject"  onclick="rejectStagedMX(${i})">✕ Отклонить</button>
       </div>
